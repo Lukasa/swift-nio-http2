@@ -20,7 +20,7 @@ struct ConnectionStreamState {
     static let defaultMaxConcurrentStreams: UInt32 = 100
 
     /// The underlying data storage for the HTTP/2 stream state.
-    private var activeStreams: [HTTP2StreamID: HTTP2StreamStateMachine]
+    private var activeStreams: StreamMap<HTTP2StreamStateMachine>
 
     /// A collection of recently reset streams.
     ///
@@ -64,7 +64,7 @@ struct ConnectionStreamState {
 
     init() {
         // While there may be many concurrent streams, usually there will only be a small number.
-        self.activeStreams = Dictionary(minimumCapacity: 8)
+        self.activeStreams = StreamMap()
         self.recentlyResetStreams = CircularBuffer(initialCapacity: self.maxResetStreams)
     }
 
@@ -80,7 +80,7 @@ struct ConnectionStreamState {
     mutating func createRemotelyPushedStream(streamID: HTTP2StreamID, remoteInitialWindowSize: UInt32) throws {
         try self.reserveServerStreamID(streamID)
         let streamState = HTTP2StreamStateMachine(receivedPushPromiseCreatingStreamID: streamID, remoteInitialWindowSize: remoteInitialWindowSize)
-        self.activeStreams[streamID] = streamState
+        self.activeStreams.insert(streamState)
     }
 
     /// Create stream state for a locally pushed stream.
@@ -95,7 +95,7 @@ struct ConnectionStreamState {
     mutating func createLocallyPushedStream(streamID: HTTP2StreamID, localInitialWindowSize: UInt32) throws {
         try self.reserveServerStreamID(streamID)
         let streamState = HTTP2StreamStateMachine(sentPushPromiseCreatingStreamID: streamID, localInitialWindowSize: localInitialWindowSize)
-        self.activeStreams[streamID] = streamState
+        self.activeStreams.insert(streamState)
     }
 
     // These functions exist as a performance optimisation: by mutating the optional returned from Dictionary directly
@@ -143,13 +143,13 @@ struct ConnectionStreamState {
         // FIXME(cory): This isn't ideal, but it's necessary to avoid issues with overlapping accesses on the activeStreams
         // dictionary. The above closure takes a mutable copy of self, which is a big issue, so we should investigate whether
         // it's possible for me to be smarter here.
-        var activeStreams: [HTTP2StreamID: HTTP2StreamStateMachine] = [:]
+        var activeStreams: StreamMap<HTTP2StreamStateMachine> = .empty()
         swap(&activeStreams, &self.activeStreams)
         defer {
             swap(&activeStreams, &self.activeStreams)
         }
 
-        guard let result = try activeStreams[streamID].transformOrCreateAutoClose(creator, modifier) else {
+        guard let result = try activeStreams.transformOrCreateAutoClose(streamID: streamID, creator, modifier) else {
             preconditionFailure("Stream was missing even though we should have created it!")
         }
 
@@ -176,7 +176,7 @@ struct ConnectionStreamState {
                                     ignoreRecentlyReset: Bool,
                                     ignoreClosed: Bool = false,
                                     _ modifier: (inout HTTP2StreamStateMachine) -> StateMachineResultWithStreamEffect) -> StateMachineResultWithStreamEffect {
-        guard let result = self.activeStreams[streamID].autoClosingTransform(modifier) else {
+        guard let result = self.activeStreams.autoClosingTransform(streamID: streamID, modifier) else {
             return StateMachineResultWithStreamEffect(result: self.streamMissing(streamID: streamID, ignoreRecentlyReset: ignoreRecentlyReset, ignoreClosed: ignoreClosed), effect: nil)
         }
 
@@ -201,7 +201,7 @@ struct ConnectionStreamState {
     @inline(__always)
     mutating func locallyResetStreamState(streamID: HTTP2StreamID,
                                           _ modifier: (inout HTTP2StreamStateMachine) -> StateMachineResultWithStreamEffect) -> StateMachineResultWithStreamEffect {
-        guard let result = self.activeStreams[streamID].autoClosingTransform(modifier) else {
+        guard let result = self.activeStreams.autoClosingTransform(streamID: streamID, modifier) else {
             // We never ignore recently reset streams here, as this should only ever be used when *sending* frames.
             return StateMachineResultWithStreamEffect(result: self.streamMissing(streamID: streamID, ignoreRecentlyReset: false, ignoreClosed: false), effect: nil)
         }
@@ -271,13 +271,15 @@ struct ConnectionStreamState {
     mutating func dropAllStreamsWithIDHigherThan(_ streamID: HTTP2StreamID,
                                                  droppedLocally: Bool,
                                                  initiatedBy initiator: HTTP2ConnectionStateMachine.ConnectionRole) -> [HTTP2StreamID]? {
-        let idsToDrop = self.activeStreams.keys.filter { $0.mayBeInitiatedBy(initiator) && $0 > streamID }
+        // We create an array here because otherwise this collection will CoW the active streams. This operation is rare, so we will
+        // accept the allocation here.
+        let idsToDrop: Array<HTTP2StreamID> = self.activeStreams.streamIDs(for: initiator).filter { $0 > streamID }
         guard idsToDrop.count > 0 else {
             return nil
         }
 
         for closingStreamID in idsToDrop {
-            self.activeStreams.removeValue(forKey: closingStreamID)
+            self.activeStreams.removeValue(forStreamID: closingStreamID)
 
             if droppedLocally {
                 self.recentlyResetStreams.prependWithoutExpanding(closingStreamID)
@@ -322,10 +324,11 @@ struct ConnectionStreamState {
     }
 
     private mutating func streamClosed(_ streamID: HTTP2StreamID) {
-        assert(!self.activeStreams.keys.contains(streamID))
         if streamID.mayBeInitiatedBy(.client) {
+            assert(!self.activeStreams.streamIDs(for: .client).contains(streamID))
             self.clientStreamCount -= 1
         } else {
+            assert(!self.activeStreams.streamIDs(for: .server).contains(streamID))
             self.serverStreamCount -= 1
         }
     }
@@ -342,24 +345,6 @@ private extension CircularBuffer {
         self.prepend(element)
     }
 }
-
-
-internal extension Dictionary {
-    /// Calls a function once with each value of the dictionary, allowing the function
-    /// to mutate the value in-place in the dictionary.
-    ///
-    /// As with the other block-taking functions in this module, this is @inline(__always) to ensure
-    /// that we don't end up actually heap-allocating a closure here. We're sorry about it!
-    @inline(__always)
-    mutating func mutatingForEachValue(_ body: (inout Value) throws -> Void) rethrows {
-        var index = self.startIndex
-        while index != self.endIndex {
-            try body(&self.values[index])
-            self.formIndex(after: &index)
-        }
-    }
-}
-
 
 extension StreamStateChange {
     fileprivate var closedStream: Bool {
